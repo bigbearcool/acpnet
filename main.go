@@ -38,14 +38,16 @@ const (
 )
 
 type handshakeRequest struct {
-	Token string `json:"token"`
-	Agent string `json:"agent"`
-	Cwd   string `json:"cwd"`
+	Token      string `json:"token"`
+	Agent      string `json:"agent"`
+	Cwd        string `json:"cwd"`
+	ReverseMCP bool   `json:"reverseMcp,omitempty"`
 }
 
 type handshakeResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	OK         bool   `json:"ok"`
+	Error      string `json:"error,omitempty"`
+	ReverseMCP bool   `json:"reverseMcp,omitempty"`
 }
 
 type pathMapping struct {
@@ -73,10 +75,11 @@ type serverConfig struct {
 }
 
 type clientConfig struct {
-	server string
-	token  string
-	agent  string
-	cwd    string
+	server     string
+	token      string
+	agent      string
+	cwd        string
+	reverseMCP bool
 }
 
 type prefixedConn struct {
@@ -133,6 +136,7 @@ func runServe(args []string) error {
 	}
 
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	loopbackOnly := fs.Bool("loopback-only", false, "require literal loopback TCP and HTTP listeners (for SSH tunneling)")
 	fs.StringVar(&cfg.tcpListenAddr, "listen", cfg.tcpListenAddr, "raw TCP listen address; set to empty to disable")
 	fs.StringVar(&cfg.httpListenAddr, "http-listen", cfg.httpListenAddr, "HTTP CONNECT listen address")
 	fs.StringVar(&cfg.httpPath, "http-path", cfg.httpPath, "HTTP CONNECT path")
@@ -145,6 +149,19 @@ func runServe(args []string) error {
 	}
 	if cfg.token == "" {
 		return errors.New("missing shared secret: pass --token or set ACPX_HOST_BRIDGE_TOKEN")
+	}
+	if *loopbackOnly {
+		// This mode relies on SSH as the sole remote transport. Refuse
+		// wildcard, DNS, or LAN listeners rather than trusting deployment flags.
+		for _, addr := range []string{cfg.tcpListenAddr, cfg.httpListenAddr} {
+			if addr == "" {
+				continue
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil || (host != "127.0.0.1" && host != "::1") {
+				return errors.New("loopback-only requires literal loopback listeners")
+			}
+		}
 	}
 	if cfg.httpPath == "" {
 		cfg.httpPath = defaultHTTPPath
@@ -280,7 +297,7 @@ func newHTTPHandler(ctx context.Context, cfg serverConfig) http.Handler {
 			_ = conn.Close()
 			return
 		}
-		go handleBridgeConn(ctx, conn, r.RemoteAddr, cfg)
+		go handleBridgeConn(ctx, &prefixedConn{Conn: conn, reader: rw.Reader}, r.RemoteAddr, cfg)
 	})
 	return mux
 }
@@ -366,7 +383,7 @@ func handleBridgeConn(parent context.Context, conn net.Conn, peer string, cfg se
 	}
 
 	log.Printf("%s started agent=%q pid=%d cwd=%q", logPrefix, req.Agent, cmd.Process.Pid, hostCwd)
-	if err := writeHandshakeResponse(conn, handshakeResponse{OK: true}); err != nil {
+	if err := writeHandshakeResponse(conn, handshakeResponse{OK: true, ReverseMCP: req.ReverseMCP}); err != nil {
 		log.Printf("%s write handshake response failed: %v", logPrefix, err)
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -374,6 +391,17 @@ func handleBridgeConn(parent context.Context, conn net.Conn, peer string, cfg se
 	}
 
 	go streamStderr(stderrPipe, logPrefix, req.Agent)
+	if req.ReverseMCP {
+		bridgeConn := &prefixedConn{Conn: conn, reader: reader}
+		err := runReverseServer(ctx, bridgeConn, stdoutPipe, stdinPipe, cfg.mappings)
+		cancel()
+		_ = stdinPipe.Close()
+		_ = cmd.Wait()
+		if err != nil && !errors.Is(err, io.EOF) {
+			log.Printf("%s reverse bridge ended: %v", logPrefix, err)
+		}
+		return
+	}
 
 	var copyWG sync.WaitGroup
 	copyWG.Add(2)
@@ -451,6 +479,7 @@ func runClient(args []string) error {
 	fs.StringVar(&cfg.token, "token", cfg.token, "shared secret")
 	fs.StringVar(&cfg.agent, "agent", cfg.agent, "remote agent name (codex or claude)")
 	fs.StringVar(&cfg.cwd, "cwd", cfg.cwd, "reported working directory")
+	fs.BoolVar(&cfg.reverseMCP, "reverse-mcp", false, "forward session/new literal-loopback MCP URLs through the bridge")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -468,9 +497,10 @@ func runClient(args []string) error {
 	defer conn.Close()
 
 	req := handshakeRequest{
-		Token: cfg.token,
-		Agent: cfg.agent,
-		Cwd:   cfg.cwd,
+		Token:      cfg.token,
+		Agent:      cfg.agent,
+		Cwd:        cfg.cwd,
+		ReverseMCP: cfg.reverseMCP,
 	}
 	if err := writeJSONLine(conn, req); err != nil {
 		return fmt.Errorf("send handshake: %w", err)
@@ -488,6 +518,12 @@ func runClient(args []string) error {
 	}
 	if !resp.OK {
 		return fmt.Errorf("remote rejected request: %s", resp.Error)
+	}
+	if cfg.reverseMCP {
+		if !resp.ReverseMCP {
+			return errors.New("server does not support reverse MCP")
+		}
+		return runReverseClient(context.Background(), &prefixedConn{Conn: conn.(net.Conn), reader: reader}, os.Stdin, os.Stdout)
 	}
 
 	errCh := make(chan error, 2)
@@ -611,7 +647,7 @@ func relayStream(dst io.Writer, src io.Reader, mappings pathMappings, direction 
 	reader := bufio.NewReader(src)
 	var total int64
 	for {
-		line, err := readLineFragment(reader)
+		line, err := readBoundedLine(reader, acpLineLimit)
 		if len(line) > 0 {
 			out := rewriteLine(line, mappings, direction)
 			n, writeErr := dst.Write(out)
@@ -714,14 +750,6 @@ func replacePathPrefix(input string, from string, to string) (string, bool) {
 		return filepath.Clean(to + suffix), true
 	}
 	return "", false
-}
-
-func readLineFragment(reader *bufio.Reader) ([]byte, error) {
-	line, err := reader.ReadBytes('\n')
-	if err != nil && len(line) == 0 {
-		return nil, err
-	}
-	return line, err
 }
 
 func streamStderr(r io.Reader, prefix string, agent string) {

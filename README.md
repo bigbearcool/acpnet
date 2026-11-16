@@ -238,6 +238,39 @@ HTTP CONNECT:
 
 If `--server` does not include a scheme, it defaults to raw TCP.
 
+### Client-local MCP forwarding
+
+With matching updated client and server binaries, add `--reverse-mcp` to the
+client command to forward literal `127.0.0.1` or `[::1]` HTTP(S) URLs in
+ACP `session/new` MCP server entries. Each URL needs an explicit port.
+The server substitutes a temporary loopback URL with an unguessable path;
+only URLs declared by the ACP session that returns a matching `sessionId` are
+authorized as targets. Authorization is revoked, and that session's listeners
+are closed, when the client sends `session/close` for it; closing the ACP
+connection still tears down everything. Loopback-looking URLs that cannot be
+forwarded (`localhost`, `127.0.0.2`, unspecified addresses, missing ports,
+credentials, fragments) fail the `session/new` request locally with a
+JSON-RPC error instead of being passed through to the remote agent. This is
+opt-in and an older server is rejected rather than silently downgrading.
+
+Only literal IPs, `localhost`/`*.localhost`, and ambiguous numeric IPv4
+forms are classified without DNS lookup. Other hostnames, including custom
+names mapped to the client loopback in hosts files or DNS, are passed through
+to the remote agent and resolved there; they are not forwarded or rejected as
+local. Use an explicit `127.0.0.1` or `[::1]` URL with a port for forwarding,
+and do not rely on hostname resolution as a security boundary.
+
+Server-sent-event responses are relayed incrementally, so long-lived MCP
+streams keep working. Other requests and responses are buffered with a 4 MiB
+limit per body, ACP lines are capped at 7 MiB, and reverse frames at 16 MiB
+(base64 inflation included). Receiving headers times out after two minutes and
+an unanswered forwarded request returns 504; streams are limited to 30 minutes.
+Listener HTTP servers use 10 s header, 30 s read and 90 s idle timeouts, with a
+30 s write deadline per streamed chunk. At most 32 local MCP requests can run
+concurrently. The bridge token, MCP headers and payloads are exposed on
+plaintext TCP/HTTP transports: use HTTPS CONNECT or a separately encrypted
+trusted tunnel across untrusted networks.
+
 ## Using with acpx
 
 The cleanest setup is to override `acpx` agent aliases in `~/.acpx/config.json`.
@@ -419,6 +452,7 @@ Real Codex / Claude Code integrations require local credentials and are not suit
 
 - The bridge is not anonymous. Use a strong random token.
 - Raw TCP should usually be bound to a private interface.
+- For SSH-tunneled deployments, opt into `serve --loopback-only --listen 127.0.0.1:4601`. This rejects any enabled TCP or HTTP listener whose host is not the literal `127.0.0.1` or `::1` (including `localhost`, wildcard and LAN addresses). Set `--listen ''` to disable TCP if using only HTTP. The legacy default remains `0.0.0.0:4601`, so `--loopback-only` without an explicit loopback `--listen` fails closed. This listener restriction does not sandbox agent commands or restrict path mappings.
 - HTTP CONNECT mode is convenient for remote routing, but you should still put it behind your own network boundary or reverse proxy.
 - Path rewriting is intentionally simple: it rewrites absolute path prefixes in JSON values. That is sufficient for ACP NDJSON traffic, but you should still test your exact workflow before exposing it broadly.
 
